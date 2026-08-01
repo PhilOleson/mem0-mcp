@@ -1,0 +1,22 @@
+services:
+  mem0-mcp:
+    build: .
+    image: mem0-mcp:latest
+    container_name: mem0-mcp
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    environment:
+      MEM0_URL: ${MEM0_URL:-http://host.docker.internal:8000}
+      MEM0_USER_ID: ${MEM0_USER_ID:-default_user}
+      FASTMCP_HOST: "0.0.0.0"
+      FASTMCP_PORT: "8001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - mem0_mcp_data:/data
+
+volumes:
+  mem0_mcp_data:
