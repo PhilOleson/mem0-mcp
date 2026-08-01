@@ -1,2 +1,4 @@
-mcp[cli]>=1.27
+# 2.0.0 restructured fastmcp out of mcp.server.fastmcp entirely (breaking
+# import, not yet migrated) — pin below it.
+mcp[cli]>=1.27,<2.0
 httpx>=0.28
