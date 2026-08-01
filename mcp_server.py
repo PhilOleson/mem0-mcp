@@ -45,8 +45,23 @@ RECENCY_HALFLIFE_DAYS = float(os.getenv("RECENCY_HALFLIFE_DAYS", "30"))
 # omitted from the results array entirely (no event, no id — confirmed
 # against a live server), and a genuine "UPDATE" event only fires for a
 # narrow LLM judgment call that's rare in practice. A pre-add similarity
-# search is the only reliable way to get a candidate memory_id to bump.
-REINFORCEMENT_THRESHOLD = float(os.getenv("REINFORCEMENT_THRESHOLD", "0.85"))
+# search is the only reliable way to get a candidate memory_id to check.
+#
+# Similarity score alone isn't precise enough to bump on directly — tested
+# live, a topically-related-but-different fact scored HIGHER (0.836) than a
+# genuine paraphrase of the actual target (0.833). Short facts sharing a
+# subject/domain (e.g. "Phil" + "homelab") cluster too tightly in embedding
+# space to separate "same fact reworded" from "different fact, same topic"
+# by threshold. So the threshold below is only a cheap pre-filter to skip
+# obviously-unrelated candidates; the LLM makes the actual same-fact call.
+REINFORCEMENT_PREFILTER_THRESHOLD = float(os.getenv("REINFORCEMENT_PREFILTER_THRESHOLD", "0.75"))
+
+# LLM used to judge "is this the same fact, reworded" for candidates that
+# clear the pre-filter. Unset (default) disables the judgment step entirely
+# — reinforcement detection is then a no-op, not a threshold guess.
+JUDGE_LLM_BASE_URL = os.getenv("JUDGE_LLM_BASE_URL", "").rstrip("/")
+JUDGE_LLM_API_KEY = os.getenv("JUDGE_LLM_API_KEY", "not-needed")
+JUDGE_LLM_MODEL = os.getenv("JUDGE_LLM_MODEL", "")
 
 
 def _db() -> sqlite3.Connection:
@@ -105,8 +120,46 @@ def _bump_mention(memory_id: str) -> None:
         pass
 
 
+def _llm_judges_same_fact(new_content: str, existing_memory: str) -> bool:
+    """Ask the judge LLM whether new_content restates/reinforces existing_memory
+    as the same underlying fact, rather than introducing different information.
+    """
+    if not JUDGE_LLM_BASE_URL:
+        return False
+    try:
+        resp = httpx.post(
+            f"{JUDGE_LLM_BASE_URL}/chat/completions",
+            json={
+                "model": JUDGE_LLM_MODEL,
+                "temperature": 0,
+                "max_tokens": 5,
+                "messages": [
+                    {"role": "system", "content": "Answer only YES or NO. No punctuation, no explanation."},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Existing memory: {existing_memory}\n"
+                            f"New statement: {new_content}\n\n"
+                            "Does the new statement restate or reinforce the existing memory "
+                            "as the same underlying fact (possibly reworded), rather than "
+                            "describing different or additional information? Answer YES or NO."
+                        ),
+                    },
+                ],
+            },
+            headers={"Authorization": f"Bearer {JUDGE_LLM_API_KEY}"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        answer = resp.json()["choices"][0]["message"]["content"].strip().upper()
+        return answer.startswith("YES")
+    except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError):
+        return False
+
+
 def _check_reinforcement(content: str) -> None:
-    """Search for a highly-similar existing memory and bump it if found.
+    """Find a candidate existing memory via search, then have the judge LLM
+    confirm it's actually the same fact before bumping its mention count.
 
     Best-effort: runs before the add itself, never blocks or fails a write.
     """
@@ -119,8 +172,13 @@ def _check_reinforcement(content: str) -> None:
         resp.raise_for_status()
         data = resp.json()
         results = data if isinstance(data, list) else data.get("results", [])
-        if results and results[0].get("id") and float(results[0].get("score", 0)) >= REINFORCEMENT_THRESHOLD:
-            _bump_mention(results[0]["id"])
+        if not results or not results[0].get("id"):
+            return
+        candidate = results[0]
+        if float(candidate.get("score", 0)) < REINFORCEMENT_PREFILTER_THRESHOLD:
+            return
+        if _llm_judges_same_fact(content, candidate.get("memory", "")):
+            _bump_mention(candidate["id"])
     except (httpx.HTTPError, ValueError, KeyError, TypeError):
         pass
 
