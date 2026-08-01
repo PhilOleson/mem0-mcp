@@ -40,6 +40,14 @@ SEARCH_TOP_K = int(os.getenv("SEARCH_TOP_K", "10"))
 MENTION_ALPHA = float(os.getenv("MENTION_ALPHA", "0.3"))
 RECENCY_HALFLIFE_DAYS = float(os.getenv("RECENCY_HALFLIFE_DAYS", "30"))
 
+# mem0's /memories response can't be relied on to signal reinforcement:
+# near-duplicate content it classifies as "no update needed" is silently
+# omitted from the results array entirely (no event, no id — confirmed
+# against a live server), and a genuine "UPDATE" event only fires for a
+# narrow LLM judgment call that's rare in practice. A pre-add similarity
+# search is the only reliable way to get a candidate memory_id to bump.
+REINFORCEMENT_THRESHOLD = float(os.getenv("REINFORCEMENT_THRESHOLD", "0.85"))
+
 
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(DEDUPE_DB, timeout=5)
@@ -97,6 +105,26 @@ def _bump_mention(memory_id: str) -> None:
         pass
 
 
+def _check_reinforcement(content: str) -> None:
+    """Search for a highly-similar existing memory and bump it if found.
+
+    Best-effort: runs before the add itself, never blocks or fails a write.
+    """
+    try:
+        resp = httpx.post(
+            f"{MEM0_URL}/search",
+            json={"query": content, "filters": {"user_id": USER_ID}, "top_k": 1},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = data if isinstance(data, list) else data.get("results", [])
+        if results and results[0].get("id") and float(results[0].get("score", 0)) >= REINFORCEMENT_THRESHOLD:
+            _bump_mention(results[0]["id"])
+    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+        pass
+
+
 def _get_mention_counts(memory_ids: list) -> dict:
     """Return {memory_id: count} for the given IDs."""
     if not memory_ids:
@@ -141,6 +169,7 @@ def add_memory(content: str) -> str:
     """Store a memory in mem0. Pass the raw text you want to remember."""
     if _is_duplicate_add(content):
         return "Skipped: identical content was already stored within the last 7 days."
+    _check_reinforcement(content)
     _t0 = time.monotonic()
     resp = httpx.post(
         f"{MEM0_URL}/memories",
@@ -154,7 +183,9 @@ def add_memory(content: str) -> str:
         logging.info("add_memory: POST /memories completed in %.1fs", _elapsed)
     resp.raise_for_status()
     data = resp.json()
-    # Bump mention count for memories that were reinforced (not newly created).
+    # Fallback: bump mention count if mem0 ever does return UPDATE/NONE
+    # directly (observed in practice: it doesn't, see _check_reinforcement
+    # above, but this is free/harmless to leave in if that changes).
     for result in (data if isinstance(data, list) else data.get("results", [])):
         if result.get("event") in ("UPDATE", "NONE") and result.get("id"):
             _bump_mention(result["id"])

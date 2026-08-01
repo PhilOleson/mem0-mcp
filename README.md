@@ -11,7 +11,7 @@ mem0's default search ranks purely on embedding similarity. That's fine at low m
 
 **How it works:**
 
-1. `add_memory` calls mem0's `/memories` endpoint as normal. mem0 returns an `event` per result — `ADD`, `UPDATE`, or `NONE`. `UPDATE`/`NONE` means the new content matched or reinforced an existing memory rather than creating a new one; that memory's mention count gets bumped (debounced to at most once per memory per window, so a single conversation re-mentioning the same fact several times doesn't inflate the count).
+1. `add_memory` first runs a similarity search for the new content against existing memories. A strong match (above `REINFORCEMENT_THRESHOLD`) is treated as reinforcement of that memory, and its mention count gets bumped (debounced to at most once per memory per window, so a single conversation re-mentioning the same fact several times doesn't inflate the count). Only then does it call mem0's own `/memories` endpoint to actually store the content. This detects reinforcement itself rather than relying on mem0's response to signal it — in practice, mem0's `/memories` response doesn't reliably surface this: near-duplicate content it classifies as "no update needed" is silently omitted from the response entirely (no event, no id), and a genuine `UPDATE` event only fires for a narrow same-memory-text-update judgment call that's rare in normal use.
 2. `search_memories` over-fetches candidates from mem0's similarity search, then rescales each by:
 
    ```
@@ -32,6 +32,10 @@ Mention counts are stored locally (SQLite, not in mem0's own metadata), which me
 | `get_all_memories()` | List everything stored |
 | `update_memory(memory_id, content)` | Replace a memory's text |
 | `delete_memory(memory_id)` | Delete a memory |
+
+## compatibility
+
+Tested against a self-hosted mem0 server built from `mem0ai` 2.0.6. The reinforcement-detection approach (see above) deliberately doesn't depend on the `event` field mem0's `/memories` response returns, so it isn't tied to a specific mem0 version — it only needs the standard `/memories` and `/search` endpoints, which have been stable across mem0's 2.x releases including the newer ADD-only consolidation model (2.0.15+, where `/memories` always returns `event: "ADD"` and never `UPDATE`/`NONE`).
 
 ## setup
 
